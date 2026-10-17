@@ -1,0 +1,165 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.37;
+
+contract OmniPatentLicensingHub {
+    struct Patent {
+        address payable inventor;
+        uint256 licenseFeeWei;
+        bool isAvailable;
+        bytes32 documentHash;
+    }
+
+    address payable public immutable hubAdmin;
+    string public hubDescriptor;
+    uint256 public platformFeeBps; // 200 = 2%
+    uint256 public patentCounter;
+    uint256 public accumulatedFees;
+    bool public isHubPaused;
+
+    mapping(uint256 => Patent) public patents;
+    mapping(uint256 => mapping(address => bool)) public hasLicense;
+
+    event LicensePurchased(uint256 indexed patentId, address indexed licensee, uint256 feePaid);
+    event OfferCanceled(uint256 indexed patentId);
+    event TreasuryDeposited(address indexed funder, uint256 amount);
+    event HubReservesDrained(address indexed admin, uint256 amount);
+    event FeesHarvested(address indexed admin, uint256 amount);
+    event HubPauseToggled(bool isPaused);
+    event PatentRegistered(uint256 indexed patentId, address indexed inventor, uint256 licenseFee);
+    event OwnershipTransferred(uint256 indexed patentId, address indexed oldInventor, address indexed newInventor);
+    event DescriptorUpdated(string newDescriptor);
+
+    modifier onlyAdmin() {
+        require(msg.sender == hubAdmin, "OmniPatent: Access denied");
+        _;
+    }
+
+    modifier whenNotPaused() {
+        require(!isHubPaused, "OmniPatent: Hub is paused");
+        _;
+    }
+
+    constructor() {
+        hubAdmin = payable(msg.sender);
+        hubDescriptor = "Omni Base Patent Licensing Hub v1";
+        platformFeeBps = 200; // 2%
+        isHubPaused = false;
+    }
+
+    // 1. buyPatentLicense
+    function buyPatentLicense(uint256 patentId) external payable whenNotPaused {
+        Patent storage p = patents[patentId];
+        require(patentId > 0 && patentId <= patentCounter, "OmniPatent: Invalid ID");
+        require(p.isAvailable, "OmniPatent: License not available");
+        require(!hasLicense[patentId][msg.sender], "OmniPatent: Already licensed");
+        require(msg.value >= p.licenseFeeWei, "OmniPatent: Insufficient fee sent");
+
+        uint256 fee = (msg.value * platformFeeBps) / 10000;
+        uint256 inventorShare = msg.value - fee;
+
+        accumulatedFees += fee;
+        hasLicense[patentId][msg.sender] = true;
+
+        if (inventorShare > 0) {
+            (bool sent, ) = p.inventor.call{value: inventorShare}("");
+            require(sent, "OmniPatent: Inventor payout failed");
+        }
+
+        emit LicensePurchased(patentId, msg.sender, msg.value);
+    }
+
+    // 2. cancelLicenseOffer
+    function cancelLicenseOffer(uint256 patentId) external {
+        Patent storage p = patents[patentId];
+        require(patentId > 0 && patentId <= patentCounter, "OmniPatent: Invalid ID");
+        require(msg.sender == p.inventor || msg.sender == hubAdmin, "OmniPatent: Unauthorized");
+        require(p.isAvailable, "OmniPatent: Already unavailable");
+
+        p.isAvailable = false;
+        emit OfferCanceled(patentId);
+    }
+
+    // 3. depositPlatformTreasury
+    function depositPlatformTreasury() external payable whenNotPaused {
+        require(msg.value > 0, "OmniPatent: Zero deposit");
+        accumulatedFees += msg.value;
+        emit TreasuryDeposited(msg.sender, msg.value);
+    }
+
+    // 4. drainHubReserves
+    function drainHubReserves() external onlyAdmin {
+        uint256 balance = address(this).balance;
+        require(balance > 0, "OmniPatent: Zero balance");
+
+        accumulatedFees = 0;
+        (bool sent, ) = hubAdmin.call{value: balance}("");
+        require(sent, "OmniPatent: Sweep failed");
+
+        emit HubReservesDrained(hubAdmin, balance);
+    }
+
+    // 5. harvestPlatformFees
+    function harvestPlatformFees() external onlyAdmin {
+        uint256 amount = accumulatedFees;
+        require(amount > 0, "OmniPatent: Zero fees");
+
+        accumulatedFees = 0;
+        (bool sent, ) = hubAdmin.call{value: amount}("");
+        require(sent, "OmniPatent: Harvest failed");
+
+        emit FeesHarvested(hubAdmin, amount);
+    }
+
+    // 6. pauseLicensingHub
+    function pauseLicensingHub(bool isPaused) external onlyAdmin {
+        isHubPaused = isPaused;
+        emit HubPauseToggled(isPaused);
+    }
+
+    // 7. registerNewPatent
+    function registerNewPatent(uint256 licenseFeeWei, bytes32 documentHash) external whenNotPaused returns (uint256) {
+        require(licenseFeeWei > 0, "OmniPatent: Free licenses not supported via hub");
+
+        patentCounter++;
+        patents[patentCounter] = Patent({
+            inventor: payable(msg.sender),
+            licenseFeeWei: licenseFeeWei,
+            isAvailable: true,
+            documentHash: documentHash
+        });
+
+        emit PatentRegistered(patentCounter, msg.sender, licenseFeeWei);
+        return patentCounter;
+    }
+
+    // 8. transferPatentOwnership
+    function transferPatentOwnership(uint256 patentId, address payable newInventor) external {
+        Patent storage p = patents[patentId];
+        require(patentId > 0 && patentId <= patentCounter, "OmniPatent: Invalid ID");
+        require(msg.sender == p.inventor || msg.sender == hubAdmin, "OmniPatent: Unauthorized");
+        require(newInventor != address(0), "OmniPatent: Zero address");
+
+        address oldInventor = p.inventor;
+        p.inventor = newInventor;
+
+        emit OwnershipTransferred(patentId, oldInventor, newInventor);
+    }
+
+    // 9. updateHubDescriptor
+    function updateHubDescriptor(string calldata newDescriptor) external onlyAdmin {
+        require(bytes(newDescriptor).length > 0, "OmniPatent: Empty string");
+        hubDescriptor = newDescriptor;
+        emit DescriptorUpdated(newDescriptor);
+    }
+
+    // Read-метод
+    function getPatentInfo(uint256 patentId) external view returns (
+        address inventor,
+        uint256 licenseFeeWei,
+        bool isAvailable,
+        bytes32 documentHash
+    ) {
+        Patent memory p = patents[patentId];
+        return (p.inventor, p.licenseFeeWei, p.isAvailable, p.documentHash);
+    }
+}
